@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/threadactor777/chirpy/internal/auth"
+
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
@@ -27,10 +29,11 @@ type apiConfig struct {
 
 // User Struct returned after user creation
 type User struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
+	ID             uuid.UUID `json:"id"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	Email          string    `json:"email"`
+	HashedPassword string    `json:"password"`
 }
 
 // Chirp Struct returned after chirp creation
@@ -93,7 +96,8 @@ func (cfg *apiConfig) handlerZero(w http.ResponseWriter, r *http.Request) {
 func (cfg *apiConfig) handlerUserCreate(w http.ResponseWriter, r *http.Request) {
 
 	type parameters struct {
-		Email string `json:"email"`
+		Password string `json:"password"`
+		Email    string `json:"email"`
 	}
 
 	decoder := json.NewDecoder(r.Body)
@@ -104,7 +108,18 @@ func (cfg *apiConfig) handlerUserCreate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	user, err := cfg.db.CreateUser(context.Background(), params.Email)
+	hashedPassword, err := auth.HashPassword(params.Password)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Something went wrong with password hashing")
+		return
+	}
+
+	userParams := database.CreateUserParams{
+		Email:          params.Email,
+		HashedPassword: hashedPassword,
+	}
+
+	user, err := cfg.db.CreateUser(context.Background(), userParams)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Something went wrong")
 		return
@@ -162,6 +177,91 @@ func (cfg *apiConfig) handlerChirpCreate(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondWithJSON(w, http.StatusCreated, newChirp)
+}
+
+// Handle chirps retrieval endpoint
+func (cfg *apiConfig) handlerChirpsGet(w http.ResponseWriter, r *http.Request) {
+	chirps, err := cfg.db.GetChirps(context.Background())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to get chirps\n")
+		return
+	}
+
+	mappedChirps := []Chirp{}
+	for _, chirp := range chirps {
+		mappedChirps = append(mappedChirps, Chirp{
+			ID:        chirp.ID,
+			CreatedAt: chirp.CreatedAt,
+			UpdatedAt: chirp.UpdatedAt,
+			Body:      chirp.Body,
+			UserID:    chirp.UserID,
+		})
+	}
+
+	respondWithJSON(w, http.StatusOK, mappedChirps)
+}
+
+// Handle single chirp retrieval endpoint
+func (cfg *apiConfig) handlerChirpGet(w http.ResponseWriter, r *http.Request) {
+	chirpIDString := r.PathValue("id")
+	chirpID, err := uuid.Parse(chirpIDString)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid chirp ID\n")
+		return
+	}
+
+	chirp, err := cfg.db.GetChirpByID(context.Background(), chirpID)
+	if err != nil {
+		respondWithError(w, http.StatusNotFound, "Unable to get chirp\n")
+		return
+	}
+
+	var mappedChirp Chirp = Chirp{
+		ID:        chirp.ID,
+		CreatedAt: chirp.CreatedAt,
+		UpdatedAt: chirp.UpdatedAt,
+		Body:      chirp.Body,
+		UserID:    chirp.UserID,
+	}
+
+	respondWithJSON(w, http.StatusOK, mappedChirp)
+
+}
+
+// Handle login endpoint
+func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
+	type parameters struct {
+		Password string `json:"password"`
+		Email    string `json:"email"`
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Something went wrong")
+		return
+	}
+
+	user, err := cfg.db.GetUserByEmail(context.Background(), params.Email)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Invalid email or password")
+		return
+	}
+
+	var userNoPassword User = User{
+		ID:        user.ID,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+		Email:     user.Email,
+	}
+
+	authenticated, err := auth.CheckPasswordHash(params.Password, user.HashedPassword)
+	if err != nil || !authenticated {
+		respondWithError(w, http.StatusUnauthorized, "Invalid email or password")
+		return
+	}
+	respondWithJSON(w, http.StatusOK, userNoPassword)
 }
 
 // Check for Bad Words
@@ -258,6 +358,15 @@ func main() {
 
 	// Add user endpoint
 	mux.HandleFunc("POST /api/users", apiCfg.handlerUserCreate)
+
+	// Get chirps endpoint
+	mux.HandleFunc("GET /api/chirps", apiCfg.handlerChirpsGet)
+
+	// Get single chirp endpoint
+	mux.HandleFunc("GET /api/chirps/{id}", apiCfg.handlerChirpGet)
+
+	// Login Endpoint
+	mux.HandleFunc("POST /api/login", apiCfg.handlerLogin)
 
 	// Server Struct
 	server := &http.Server{
